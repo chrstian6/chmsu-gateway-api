@@ -1,0 +1,406 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <script
+      defer
+      src="https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js"
+    ></script>
+    <style>
+      body {
+        margin: 0;
+        background: transparent;
+        overflow: hidden;
+      }
+      canvas {
+        display: none;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="c"></canvas>
+    <script>
+      var modelsLoaded = false;
+      var frameCount = 0;
+
+      var send = function (payload) {
+        try {
+          window.ReactNativeWebView.postMessage(JSON.stringify(payload));
+        } catch (e) {}
+      };
+
+      var loadImageFromBase64 = function (base64) {
+        return new Promise(function (res, rej) {
+          var img = new Image();
+          img.onload = function () {
+            res(img);
+          };
+          img.onerror = function () {
+            rej(new Error("Image load failed"));
+          };
+          img.src = base64;
+        });
+      };
+
+      // Helper function to calculate distance between two points
+      function distance(p1, p2) {
+        return Math.sqrt(Math.pow(p2.x - p1.x, 2) + Math.pow(p2.y - p1.y, 2));
+      }
+
+      // Determine eye openness using Eye Aspect Ratio (EAR)
+      function getEyeOpenness(eyePoints) {
+        if (!eyePoints || eyePoints.length < 6) return null;
+
+        // Calculate eye aspect ratio (EAR)
+        // Vertical distances between upper and lower eyelid
+        var v1 = distance(eyePoints[1], eyePoints[5]); // Inner vertical
+        var v2 = distance(eyePoints[2], eyePoints[4]); // Outer vertical
+        // Horizontal distance across the eye
+        var h = distance(eyePoints[0], eyePoints[3]); // Horizontal
+
+        if (h === 0) return null;
+
+        var ear = (v1 + v2) / (2.0 * h);
+
+        // EAR threshold: < 0.18 typically means eye is closed
+        // Adjust this threshold based on testing (lower = more sensitive to blinks)
+        return ear > 0.18;
+      }
+
+      // Determine head turn direction based on nose position
+      function getHeadTurn(nosePoints, landmarks) {
+        if (!nosePoints || nosePoints.length < 6) return "center";
+
+        var jawline = landmarks.getJawOutline();
+        if (!jawline || jawline.length < 17) return "center";
+
+        // Compare nose tip position relative to jaw center
+        var noseTip = nosePoints[3]; // Nose tip point
+        var noseBridge = nosePoints[0]; // Nose bridge
+
+        // Calculate face center using jaw outline
+        var jawCenter = {
+          x: (jawline[0].x + jawline[16].x) / 2,
+          y: (jawline[0].y + jawline[16].y) / 2,
+        };
+
+        // Calculate nose deviation from center
+        var noseDeviation = noseTip.x - jawCenter.x;
+
+        // Use face width for threshold (more robust)
+        var faceWidth = distance(jawline[0], jawline[16]);
+        var threshold = faceWidth * 0.06; // 6% of face width
+
+        if (noseDeviation < -threshold) return "right"; // Nose left of center = head turned right
+        if (noseDeviation > threshold) return "left"; // Nose right of center = head turned left
+        return "center";
+      }
+
+      async function loadModels() {
+        try {
+          send({ type: "progress", value: 10 });
+          send({ type: "debug", message: "Loading models from CDN..." });
+
+          var CDN = "https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model";
+
+          // 1. Tiny Face Detector
+          await faceapi.nets.tinyFaceDetector.loadFromUri(CDN);
+          send({ type: "progress", value: 30 });
+          send({ type: "debug", message: "tinyFaceDetector loaded" });
+
+          // 2. Face Landmark 68 (full - needed for landmarks and head tracking)
+          await faceapi.nets.faceLandmark68Net.loadFromUri(CDN);
+          send({ type: "progress", value: 60 });
+          send({ type: "debug", message: "faceLandmark68Net loaded" });
+
+          // 3. Face Recognition
+          await faceapi.nets.faceRecognitionNet.loadFromUri(CDN);
+          send({ type: "progress", value: 100 });
+          send({ type: "debug", message: "faceRecognitionNet loaded" });
+
+          modelsLoaded = true;
+          send({ type: "modelsReady" });
+          send({ type: "debug", message: "All models loaded!" });
+        } catch (err) {
+          send({ type: "debug", message: "CDN failed: " + err.message });
+          send({
+            type: "error",
+            context: "models",
+            message: "Failed to load models: " + err.message,
+          });
+        }
+      }
+
+      // Process live frame - detect face + landmarks for verification
+      async function processLiveFrame(base64) {
+        if (!modelsLoaded) return;
+        frameCount++;
+
+        try {
+          var img = await loadImageFromBase64(base64);
+
+          // Detect face with landmarks for eye/head analysis
+          var detection = await faceapi
+            .detectSingleFace(
+              img,
+              new faceapi.TinyFaceDetectorOptions({
+                inputSize: 224,
+                scoreThreshold: 0.3,
+              }),
+            )
+            .withFaceLandmarks();
+
+          if (detection && detection.landmarks) {
+            var score = detection.detection.score;
+            var landmarks = detection.landmarks;
+
+            // Analyze eye openness
+            var leftEye = landmarks.getLeftEye();
+            var rightEye = landmarks.getRightEye();
+            var leftEyeOpen = getEyeOpenness(leftEye);
+            var rightEyeOpen = getEyeOpenness(rightEye);
+
+            // Analyze head turn based on nose position
+            var nose = landmarks.getNose();
+            var headTurn = getHeadTurn(nose, landmarks);
+
+            // Calculate EAR values for debugging
+            var leftEAR = null;
+            var rightEAR = null;
+            if (leftEye && leftEye.length >= 6) {
+              var lv1 = distance(leftEye[1], leftEye[5]);
+              var lv2 = distance(leftEye[2], leftEye[4]);
+              var lh = distance(leftEye[0], leftEye[3]);
+              leftEAR = lh > 0 ? ((lv1 + lv2) / (2.0 * lh)).toFixed(3) : null;
+            }
+            if (rightEye && rightEye.length >= 6) {
+              var rv1 = distance(rightEye[1], rightEye[5]);
+              var rv2 = distance(rightEye[2], rightEye[4]);
+              var rh = distance(rightEye[0], rightEye[3]);
+              rightEAR = rh > 0 ? ((rv1 + rv2) / (2.0 * rh)).toFixed(3) : null;
+            }
+
+            if (frameCount <= 5) {
+              send({
+                type: "debug",
+                message:
+                  "Frame " +
+                  frameCount +
+                  ": found face, score=" +
+                  score.toFixed(3) +
+                  ", leftEye=" +
+                  leftEyeOpen +
+                  " (EAR=" +
+                  leftEAR +
+                  ")" +
+                  ", rightEye=" +
+                  rightEyeOpen +
+                  " (EAR=" +
+                  rightEAR +
+                  ")" +
+                  ", head=" +
+                  headTurn,
+              });
+            }
+
+            send({
+              type: "liveFrameFaceFound",
+              confidence: score,
+              leftEyeOpen: leftEyeOpen,
+              rightEyeOpen: rightEyeOpen,
+              headTurn: headTurn,
+              earValues: {
+                left: leftEAR ? parseFloat(leftEAR) : null,
+                right: rightEAR ? parseFloat(rightEAR) : null,
+              },
+            });
+            return;
+          }
+
+          if (frameCount <= 5) {
+            send({
+              type: "debug",
+              message: "Frame " + frameCount + ": no faces detected",
+            });
+          }
+
+          send({ type: "liveFrameNoFace" });
+        } catch (err) {
+          if (frameCount <= 5) {
+            send({
+              type: "debug",
+              message:
+                "Frame " + frameCount + " error: " + (err.message || err),
+            });
+          }
+          send({ type: "liveFrameNoFace" });
+        }
+      }
+
+      // Final capture - detect + landmarks + descriptor (unchanged)
+      async function processLiveFinal(base64) {
+        try {
+          send({ type: "debug", message: "Loading image..." });
+          var img = await loadImageFromBase64(base64);
+          send({
+            type: "debug",
+            message: "Image: " + img.width + "x" + img.height,
+          });
+
+          // Step 1: Detect face with high quality
+          send({ type: "debug", message: "Detecting face..." });
+          var detection = await faceapi
+            .detectSingleFace(
+              img,
+              new faceapi.TinyFaceDetectorOptions({
+                inputSize: 416,
+                scoreThreshold: 0.25,
+              }),
+            )
+            .withFaceLandmarks() // Must have landmarks before descriptor!
+            .withFaceDescriptor();
+
+          if (
+            detection &&
+            detection.descriptor &&
+            detection.descriptor.length === 128
+          ) {
+            var finalScore = detection.detection
+              ? detection.detection.score
+              : 0;
+            send({
+              type: "debug",
+              message: "Face found! descriptor=128, score=" + finalScore,
+            });
+            send({
+              type: "liveFinalDone",
+              descriptor: Array.from(detection.descriptor),
+              dimensions: 128,
+              confidence: finalScore,
+            });
+            return;
+          }
+
+          // Retry with smaller input size
+          send({ type: "debug", message: "Retrying with inputSize=320..." });
+          detection = await faceapi
+            .detectSingleFace(
+              img,
+              new faceapi.TinyFaceDetectorOptions({
+                inputSize: 320,
+                scoreThreshold: 0.2,
+              }),
+            )
+            .withFaceLandmarks()
+            .withFaceDescriptor();
+
+          if (
+            detection &&
+            detection.descriptor &&
+            detection.descriptor.length === 128
+          ) {
+            var finalScore2 = detection.detection
+              ? detection.detection.score
+              : 0;
+            send({
+              type: "debug",
+              message:
+                "Face found on retry! descriptor=128, score=" + finalScore2,
+            });
+            send({
+              type: "liveFinalDone",
+              descriptor: Array.from(detection.descriptor),
+              dimensions: 128,
+              confidence: finalScore2,
+            });
+            return;
+          }
+
+          // Retry with even smaller input size
+          send({ type: "debug", message: "Retrying with inputSize=224..." });
+          detection = await faceapi
+            .detectSingleFace(
+              img,
+              new faceapi.TinyFaceDetectorOptions({
+                inputSize: 224,
+                scoreThreshold: 0.15,
+              }),
+            )
+            .withFaceLandmarks()
+            .withFaceDescriptor();
+
+          if (
+            detection &&
+            detection.descriptor &&
+            detection.descriptor.length === 128
+          ) {
+            var finalScore3 = detection.detection
+              ? detection.detection.score
+              : 0;
+            send({
+              type: "debug",
+              message:
+                "Face found on second retry! descriptor=128, score=" +
+                finalScore3,
+            });
+            send({
+              type: "liveFinalDone",
+              descriptor: Array.from(detection.descriptor),
+              dimensions: 128,
+              confidence: finalScore3,
+            });
+            return;
+          }
+
+          send({ type: "debug", message: "No face found after all attempts" });
+          send({
+            type: "liveFinalError",
+            message:
+              "No face detected. Please ensure good lighting and face the camera directly.",
+          });
+        } catch (err) {
+          send({ type: "debug", message: "Error: " + (err.message || err) });
+          send({
+            type: "liveFinalError",
+            message: err.message || "Processing failed",
+          });
+        }
+      }
+
+      function handleMessage(event) {
+        var msg;
+        try {
+          if (typeof event.data === "string") {
+            msg = JSON.parse(event.data);
+          } else {
+            msg = event.data;
+          }
+        } catch (e) {
+          return;
+        }
+
+        if (msg.action === "loadModels") {
+          if (typeof faceapi === "undefined") {
+            setTimeout(function () {
+              loadModels();
+            }, 2000);
+          } else {
+            loadModels();
+          }
+          return;
+        }
+        if (!modelsLoaded) return;
+        if (msg.action === "processLiveFrame") processLiveFrame(msg.base64);
+        if (msg.action === "processLiveFinal") processLiveFinal(msg.base64);
+      }
+
+      window.addEventListener("message", handleMessage);
+      document.addEventListener("message", handleMessage);
+
+      window.addEventListener("load", function () {
+        send({ type: "webviewReady" });
+      });
+    </script>
+  </body>
+</html>
